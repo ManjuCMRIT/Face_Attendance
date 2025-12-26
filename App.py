@@ -4,23 +4,11 @@ import cv2
 from PIL import Image
 from insightface.app import FaceAnalysis
 from firebase_utils import db
-from datetime import datetime
-import json
-import firebase_admin
-from firebase_admin import credentials
+from face_matcher import find_best_match
 
-# ---------------- Firebase Init ----------------
-if not firebase_admin._apps:
-    cred = credentials.Certificate(
-        json.loads(st.secrets["FIREBASE_KEY"])
-    )
-    firebase_admin.initialize_app(cred)
+st.set_page_config("Face Identification", layout="centered")
+st.title("🧑‍🏫 Classroom Face Identification")
 
-# ---------------- Page Config ----------------
-st.set_page_config(page_title="Face Attendance", layout="centered")
-st.title("🧠 Face Attendance System")
-
-# ---------------- Load Model ----------------
 @st.cache_resource
 def load_model():
     model = FaceAnalysis(name="buffalo_l")
@@ -29,61 +17,50 @@ def load_model():
 
 model = load_model()
 
-# ---------------- Utils ----------------
-def cosine_similarity(a, b):
-    return np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b))
+# Load registered users
+@st.cache_data
+def load_users():
+    users = []
+    docs = db.collection("users").stream()
+    for doc in docs:
+        data = doc.to_dict()
+        users.append(data)
+    return users
 
-# ---------------- UI ----------------
-st.info("📸 Capture face to mark attendance")
+registered_users = load_users()
 
-camera_image = st.camera_input("Take Attendance Photo")
+uploaded_file = st.file_uploader("Upload Classroom Image", type=["jpg", "png"])
 
-if camera_image:
-    img = Image.open(camera_image).convert("RGB")
+if uploaded_file:
+    img = Image.open(uploaded_file).convert("RGB")
     img_np = np.array(img)
 
     faces = model.get(img_np)
 
-    if len(faces) != 1:
-        st.error("❌ Exactly ONE face required")
+    if len(faces) == 0:
+        st.error("No faces detected")
         st.stop()
 
-    query_embedding = faces[0].embedding
+    for face in faces:
+        bbox = face.bbox.astype(int)
+        embedding = face.embedding
 
-    # Fetch registered users
-    users = db.collection("users").stream()
+        name, score = find_best_match(
+            embedding,
+            registered_users,
+            threshold=0.5
+        )
 
-    best_match = None
-    best_score = 0
+        x1, y1, x2, y2 = bbox
+        cv2.rectangle(img_np, (x1, y1), (x2, y2), (0, 255, 0), 2)
+        cv2.putText(
+            img_np,
+            f"{name} ({score:.2f})",
+            (x1, y1 - 10),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.6,
+            (255, 0, 0),
+            2
+        )
 
-    for user in users:
-        data = user.to_dict()
-        db_embedding = np.array(data["embedding"])
-
-        score = cosine_similarity(query_embedding, db_embedding)
-
-        if score > best_score:
-            best_score = score
-            best_match = data["name"]
-
-    # ---------------- Threshold ----------------
-    THRESHOLD = 0.55
-
-    if best_score >= THRESHOLD:
-        now = datetime.now()
-        date = now.strftime("%Y-%m-%d")
-        time = now.strftime("%I:%M %p")
-
-        db.collection("attendance").document(date).set({
-            best_match: {
-                "time": time,
-                "confidence": float(best_score)
-            }
-        }, merge=True)
-
-        st.success(f"✅ Attendance marked for **{best_match}**")
-        st.write(f"Confidence: `{best_score:.2f}`")
-
-    else:
-        st.error("❌ Face not recognized")
-        st.write(f"Best confidence: `{best_score:.2f}`")
+    st.image(img_np, caption="Identified Faces", use_column_width=True)
